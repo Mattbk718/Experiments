@@ -1,4 +1,4 @@
-goal = "Kick left"
+  goal = "Kick left"
 
 def get_input
   gets.strip
@@ -16,8 +16,19 @@ def goalie?(block)
   end
 end
 
+
+
+
 puts "Welcome to my soccer game!"
 puts "You are kicking a goal, you have three choices: KICK LEFT, KICK RIGHT or KICK STRAIGHT. 
-The goalie is ready!"
+The goalie is ready!
+ ---------------------
+|xxxxxxxxxxxxxxxxxxxxx|
+|xxxxxxxxxxxxxxxxxxxxx|
+|xxxxxxxxxxxxxxxxxxxxx|
+|xxxxxxxxxxxxxxxxxxxxx|
+|xxxxxxxxxxxxxxxxxxxxx|
+ ______________________
+"
 kick_off = get_input
 puts  "#{goalie?(kick_off)}"
