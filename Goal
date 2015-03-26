@@ -4,17 +4,27 @@ def get_input
   gets.strip
 end
 
-def goalie?(block)
- 
-  if block == "kick left"
-     "kick and.........GOAAALLL"
-  elsif block == "kick right"
-     "kick anddd.....BLOCKED"
-  elsif block == "kick straight"
-    "kick aaannnd....BLOCKED"
-    
+def goalie?(kick)
+  choices = ["kick left", "kick straight", "kick right"]
+  
+  if choices.sample == kick
+    str = "kick anddd.....BLOCKED"
+  else
+    str = "kick and.........GOAAALLL"
   end
+   
+  str
+ 
+ # if block == "kick left"
+ #    "kick and.........GOAAALLL"
+ # elsif block == "kick right"
+ #    "kick anddd.....BLOCKED"
+ # elsif block == "kick straight"
+ #  "kick aaannnd....BLOCKED"
+    
+  #end
 end
+
 
 
 
@@ -32,4 +42,3 @@ The goalie is ready!
 "
 kick_off = get_input
 puts  "#{goalie?(kick_off)}"
-
