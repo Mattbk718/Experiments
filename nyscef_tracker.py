@@ -185,13 +185,14 @@ def _last_row_date(page):
         if not data_rows:
             print("    _last_row_date: no <td> rows found in table.NewSearchResults")
             return None
+        today = date.today()
         best_dt, best_str = None, None
         for row in data_rows:
             text = row.inner_text() or ""
             for m in any_date.finditer(text):
                 try:
                     dt = datetime.strptime(m.group(1), "%m/%d/%Y").date()
-                    if best_dt is None or dt > best_dt:
+                    if dt <= today and (best_dt is None or dt > best_dt):
                         best_dt, best_str = dt, m.group(1)
                 except ValueError:
                     pass
