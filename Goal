@@ -1,0 +1,44 @@
+    goal = (goalie?)
+
+def get_input
+  gets.strip
+end
+
+def goalie?(kick)
+  choices = ["kick left", "kick straight", "kick right"]
+  
+  if choices.sample == kick
+    str = "kick anddd.....BLOCKED"
+  else
+    str = "kick and.........GOAAALLL"
+  end
+   
+  str
+ 
+ # if block == "kick left"
+ #    "kick and.........GOAAALLL"
+ # elsif block == "kick right"
+ #    "kick anddd.....BLOCKED"
+ # elsif block == "kick straight"
+ #  "kick aaannnd....BLOCKED"
+    
+  #end
+end
+
+
+
+
+
+puts "Welcome to my soccer game!"
+puts "You are kicking a goal, you have three choices: KICK LEFT, KICK RIGHT or KICK STRAIGHT. 
+The goalie is ready!
+ ---------------------
+|#####################|
+|#####################|
+|#####################|
+|#####################|
+|#####################|
+ ______________________
+"
+kick_off = get_input
+puts  "#{goalie?(kick_off)}"
