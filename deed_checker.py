@@ -136,20 +136,33 @@ CID = {
 AFFIDAVIT_DOC_TYPES = ("affidavit of service", "affidavit of due diligence")
 
 CLAUDE_PARSE_PROMPT = """\
-You are a legal document analyst. Read the affidavit text below and identify every \
-NATURAL PERSON (a real human being) who was served or attempted to be served, along \
-with their address.
+You are a legal document analyst reviewing a New York State foreclosure affidavit of service.
 
-Rules:
-- Include only real individuals — NOT corporations, LLCs, partnerships, banks, \
-  trusts, government agencies, municipalities, or other legal entities.
-- Do NOT include the process server, notary, or attorney.
-- For each person, extract: title (Mr./Mrs./Ms. if present, else empty string), \
-  first name, last name, street address, city, state (2-letter abbreviation), \
-  and 5-digit zip code.
-- If any address field is missing or unclear, leave it as an empty string.
-- Return ONLY valid JSON — an array of objects with keys: \
-  title, first, last, street, city, state, zip.
+Your job is to extract ONLY the PRIMARY DEFENDANTS — the mortgagors, property owners, \
+or heirs/distributees of the estate who are named defendants in the foreclosure action \
+and who are being served with the summons and complaint (or 3215 default notice) \
+regarding the subject property.
+
+DO NOT include:
+- The process server, notary public, or any attorney
+- Lienholders, banks, government agencies, or other creditors being served
+- Tenants or "John Doe / Jane Doe" occupants
+- Persons served only with motion papers, adjournment letters, or notices of entry
+- Anyone whose name appears only incidentally (e.g. in the caption as plaintiff)
+
+For each qualifying person, extract:
+  title  — Mr./Mrs./Ms. if present in the document, otherwise empty string
+  first  — first name
+  last   — last name
+  street — street address where service was made or attempted
+  city   — city
+  state  — 2-letter state abbreviation
+  zip    — 5-digit zip code
+
+If any address field is missing or unclear, use an empty string.
+
+Return ONLY valid JSON — an array of objects with keys: title, first, last, street, city, state, zip.
+Return an empty array [] if no qualifying persons are found.
 
 Affidavit text:
 \"\"\"
@@ -172,7 +185,7 @@ def load_existing_by_index(sheet):
         if not idx:
             continue
         entry = by_index.setdefault(
-            idx, {"docket": "", "plaintiff": "", "county": "", "keys": set(), "rows": []}
+            idx, {"docket": "", "plaintiff": "", "county": "", "subject": "", "keys": set(), "rows": []}
         )
         entry["rows"].append(row)
 
@@ -185,6 +198,9 @@ def load_existing_by_index(sheet):
         county = str_val(cell_value(row, CID["county"]))
         if county and not entry["county"]:
             entry["county"] = county
+        subject = str_val(cell_value(row, CID["subject"]))
+        if subject and not entry["subject"]:
+            entry["subject"] = subject
 
         first = str_val(cell_value(row, CID["first"]))
         last  = str_val(cell_value(row, CID["last"]))
@@ -208,7 +224,7 @@ def build_row(ss, idx, entry, p):
         ss.models.Cell({"column_id": CID["index"],     "value": idx}),
         ss.models.Cell({"column_id": CID["first"],     "value": p["first"]}),
         ss.models.Cell({"column_id": CID["last"],      "value": p["last"]}),
-        ss.models.Cell({"column_id": CID["subject"],   "value": full_address}),
+        ss.models.Cell({"column_id": CID["subject"],   "value": entry["subject"]}),
         ss.models.Cell({"column_id": CID["address"],   "value": p["street"]}),
         ss.models.Cell({"column_id": CID["city"],      "value": p["city"]}),
         ss.models.Cell({"column_id": CID["state"],     "value": p["state"]}),
@@ -449,7 +465,9 @@ def main():
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument("--limit", type=int, default=0,
-                        help="Process only first N cases (0 = all)")
+                        help="Process only N cases (0 = all)")
+    parser.add_argument("--offset", type=int, default=0,
+                        help="Skip the first N cases")
     parser.add_argument("--dry-run", action="store_true",
                         help="Parse and report only; do not write to Smartsheet")
     args = parser.parse_args()
@@ -472,9 +490,12 @@ def main():
     by_index = load_existing_by_index(sheet)
     cases = [(idx, e) for idx, e in by_index.items() if e["docket"]]
     print(f"{len(cases)} unique case(s) with a NYSCEF Docket ID.")
+    if args.offset > 0:
+        cases = cases[args.offset:]
+        print(f"(Skipping first {args.offset} case(s).)")
     if args.limit > 0:
         cases = cases[:args.limit]
-        print(f"(Limited to first {args.limit} case(s) for testing.)")
+        print(f"(Processing {args.limit} case(s).)")
 
     AFFIDAVIT_DIR.mkdir(parents=True, exist_ok=True)
 
