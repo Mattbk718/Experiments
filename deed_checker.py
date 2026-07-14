@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Deed Checker — scans NYSCEF Affidavits of Service for every FC Mailers case
-that has a docket ID, extracts served-party names/addresses, filters out
-non-natural persons (banks, LLCs, municipalities, etc.), and adds any new
-natural-person mailing targets to the FC Mailers sheet. Emails a full report
-of everything found for manual review.
-
-Best-effort parsing: affidavit-of-service PDFs come from many different
-process servers with wildly different formats, so name/address extraction is
-heuristic. Every parsed entry (added, already-on-file, or filtered out) is
-included in the report email so nothing is added to the sheet unreviewed.
+Deed Checker — scans NYSCEF Affidavits of Service / Due Diligence for every
+FC Mailers case that has a docket ID, extracts served-party names/addresses
+via the Claude API, filters out non-natural persons (banks, LLCs, municipalities,
+etc.), saves PDFs locally, and adds any new natural-person mailing targets to the
+FC Mailers sheet. Emails a full report for manual review.
 """
 
+import json
 import os
 import re
 import sys
@@ -27,6 +23,7 @@ from email.mime.multipart import MIMEMultipart
 from pathlib import Path
 from urllib.parse import quote, urljoin
 
+import anthropic
 import smartsheet
 from playwright.sync_api import sync_playwright
 import pdfplumber
@@ -39,10 +36,11 @@ from nyscef_tracker import (
     NYSCEF_HOME, DOC_LIST_BASE, launch_context, cell_value, str_val, _find_max_page,
 )
 
-SHEET_ID   = 6833160014063492  # FC Mailers
-EMAIL_TO   = "matt.zeltser@gmail.com"
-GMAIL_USER = os.environ.get("GMAIL_USER", "matt.zeltser@gmail.com")
-GMAIL_PASS = os.environ.get("GMAIL_APP_PASSWORD", "")
+SHEET_ID      = 6833160014063492  # FC Mailers
+EMAIL_TO      = "matt.zeltser@gmail.com"
+GMAIL_USER    = os.environ.get("GMAIL_USER", "matt.zeltser@gmail.com")
+GMAIL_PASS    = os.environ.get("GMAIL_APP_PASSWORD", "")
+AFFIDAVIT_DIR = Path.home() / "Dropbox" / "NYSCEF Affidavits"
 
 CID = {
     "filing":     4007717321871236,
@@ -65,33 +63,29 @@ CID = {
     "nyscef":     5668718826442628,
 }
 
-STATE_ABBR = ("AL|AK|AZ|AR|CA|CO|CT|DE|FL|GA|HI|ID|IL|IN|IA|KS|KY|LA|ME|MD|MA|MI|MN|MS|MO|"
-              "MT|NE|NV|NH|NJ|NM|NY|NC|ND|OH|OK|OR|PA|RI|SC|SD|TN|TX|UT|VT|VA|WA|WV|WI|WY|DC")
+AFFIDAVIT_DOC_TYPES = ("affidavit of service", "affidavit of due diligence")
 
-ADDRESS_RE = re.compile(
-    rf"(\d{{1,6}}[^\n,]{{2,60}}?),\s*([A-Za-z .'\-]{{2,40}}),?\s*({STATE_ABBR})\s*(\d{{5}})(?:-\d{{4}})?"
-)
+CLAUDE_PARSE_PROMPT = """\
+You are a legal document analyst. Read the affidavit text below and identify every \
+NATURAL PERSON (a real human being) who was served or attempted to be served, along \
+with their address.
 
-NAME_RE = re.compile(r"\b([A-Z][A-Za-z'\-]+(?:\s+[A-Z]\.?)?(?:\s+[A-Z][A-Za-z'\-]+){1,2})\b")
+Rules:
+- Include only real individuals — NOT corporations, LLCs, partnerships, banks, \
+  trusts, government agencies, municipalities, or other legal entities.
+- Do NOT include the process server, notary, or attorney.
+- For each person, extract: title (Mr./Mrs./Ms. if present, else empty string), \
+  first name, last name, street address, city, state (2-letter abbreviation), \
+  and 5-digit zip code.
+- If any address field is missing or unclear, leave it as an empty string.
+- Return ONLY valid JSON — an array of objects with keys: \
+  title, first, last, street, city, state, zip.
 
-NAME_STOPWORDS = {
-    "SUMMONS", "COMPLAINT", "COURT", "STATE", "COUNTY", "NOTICE", "PENDENCY", "PLAINTIFF",
-    "PLAINTIFFS", "DEFENDANT", "DEFENDANTS", "ACTION", "INDEX", "AFFIDAVIT", "SERVICE",
-    "DEPONENT", "ATTORNEY", "ESQ", "SUPREME", "AGAINST", "ORDER", "JUDGMENT", "MOTION",
-    "NEW", "YORK", "CITY", "OF", "THE", "AND", "FOR", "ON", "SERVED", "TRUE", "COPY",
-    "WITHIN", "PERSON", "RESIDENCE", "PLACE", "ADDRESS", "DWELLING", "ABODE", "DOOR", "SAID",
-}
-
-NON_PERSON_KEYWORDS = [
-    "LLC", "L.L.C", "INC", "CORP", "CO.", "COMPANY", "L.P.", " LP ", "LLP", "PLLC", "P.C.",
-    "BANK", "N.A.", "NATIONAL ASSOCIATION", "TRUST", "TRUSTEE", "MORTGAGE", "LOAN",
-    "SERVICING", "FINANCIAL", "CREDIT UNION", "ASSOCIATION", "HOLDINGS", "FUND", "PARTNERS",
-    "GROUP", "SERVICES", "AUTHORITY", "MUNICIPAL", "CITY OF", "COUNTY OF", "STATE OF",
-    "DEPARTMENT", "COMMISSIONER", "AGENCY", "IRS", "INTERNAL REVENUE", "UNITED STATES",
-    "HOUSING", "DEVELOPMENT", "REVENUE", "OFFICE OF", "BOARD OF", "PROPERTY OWNERS",
-    "CONDOMINIUM", "COOPERATIVE", " HOA ", "MANAGEMENT", "REALTY", "PROPERTIES",
-    "PARTNERSHIP", "ESTATE OF", "JOHN DOE", "JANE DOE",
-]
+Affidavit text:
+\"\"\"
+{text}
+\"\"\"
+"""
 
 
 # ── Smartsheet helpers ───────────────────────────────────────────────────────
@@ -123,10 +117,10 @@ def load_existing_by_index(sheet):
             entry["county"] = county
 
         first = str_val(cell_value(row, CID["first"]))
-        last = str_val(cell_value(row, CID["last"]))
-        addr = str_val(cell_value(row, CID["address"])) or str_val(cell_value(row, CID["subject"]))
-        zipc = str_val(cell_value(row, CID["zip"]))
-        key = norm(f"{first} {last} {addr} {zipc}")
+        last  = str_val(cell_value(row, CID["last"]))
+        addr  = str_val(cell_value(row, CID["address"])) or str_val(cell_value(row, CID["subject"]))
+        zipc  = str_val(cell_value(row, CID["zip"]))
+        key   = norm(f"{first} {last} {addr} {zipc}")
         if key:
             entry["keys"].add(key)
     return by_index
@@ -139,114 +133,120 @@ def is_duplicate_key(key, keyset, threshold=0.85):
 
 
 def build_row(ss, idx, entry, p):
+    full_address = f"{p['street']}, {p['city']}, {p['state']} {p['zip']}".strip(", ")
     cells = [
-        ss.models.Cell({"column_id": CID["index"], "value": idx}),
-        ss.models.Cell({"column_id": CID["first"], "value": p["first"]}),
-        ss.models.Cell({"column_id": CID["last"], "value": p["last"]}),
-        ss.models.Cell({"column_id": CID["subject"], "value": p["full_address"]}),
-        ss.models.Cell({"column_id": CID["address"], "value": p["street"]}),
-        ss.models.Cell({"column_id": CID["city"], "value": p["city"]}),
-        ss.models.Cell({"column_id": CID["state"], "value": p["state"]}),
-        ss.models.Cell({"column_id": CID["zip"], "value": p["zip"]}),
+        ss.models.Cell({"column_id": CID["index"],     "value": idx}),
+        ss.models.Cell({"column_id": CID["first"],     "value": p["first"]}),
+        ss.models.Cell({"column_id": CID["last"],      "value": p["last"]}),
+        ss.models.Cell({"column_id": CID["subject"],   "value": full_address}),
+        ss.models.Cell({"column_id": CID["address"],   "value": p["street"]}),
+        ss.models.Cell({"column_id": CID["city"],      "value": p["city"]}),
+        ss.models.Cell({"column_id": CID["state"],     "value": p["state"]}),
+        ss.models.Cell({"column_id": CID["zip"],       "value": p["zip"]}),
         ss.models.Cell({"column_id": CID["plaintiff"], "value": entry["plaintiff"]}),
-        ss.models.Cell({"column_id": CID["county"], "value": entry["county"]}),
-        ss.models.Cell({"column_id": CID["nyscef"], "value": entry["docket"]}),
-        ss.models.Cell({"column_id": CID["bounced"], "value": False}),
-        ss.models.Cell({"column_id": CID["door_knock"], "value": False}),
+        ss.models.Cell({"column_id": CID["county"],    "value": entry["county"]}),
+        ss.models.Cell({"column_id": CID["nyscef"],    "value": entry["docket"]}),
+        ss.models.Cell({"column_id": CID["bounced"],   "value": False}),
+        ss.models.Cell({"column_id": CID["door_knock"],"value": False}),
     ]
-    if p["title"]:
+    if p.get("title"):
         cells.append(ss.models.Cell({"column_id": CID["title"], "value": p["title"]}))
     return ss.models.Row({"cells": cells})
 
 
-# ── name / address parsing ───────────────────────────────────────────────────
+# ── Claude API parsing ────────────────────────────────────────────────────────
 
-def is_natural_person(name):
-    upper = f" {name.upper()} "
-    if any(kw in upper for kw in NON_PERSON_KEYWORDS):
-        return False
-    words = name.split()
-    if not (2 <= len(words) <= 4):
-        return False
-    if any(ch.isdigit() for ch in name):
-        return False
-    return True
+def parse_affidavit_with_claude(client, text):
+    """
+    Use the Claude API to extract natural persons and their addresses from
+    affidavit text. Returns a list of dicts with keys:
+    title, first, last, street, city, state, zip.
+    Falls back to an empty list on any error.
+    """
+    if not text or not text.strip():
+        return []
 
+    # Truncate to avoid token limits while keeping the most relevant content
+    truncated = text[:12000]
 
-def find_name_before(text, pos, window=250):
-    snippet = text[max(0, pos - window):pos]
-    candidates = NAME_RE.findall(snippet)
-    for cand in reversed(candidates):
-        words = [w.strip(".") for w in cand.split()]
-        if len(words) < 2 or any(w.upper() in NAME_STOPWORDS for w in words):
-            continue
-        return cand.strip()
-    return None
-
-
-def guess_title(text, pos, name, window=250):
-    start = max(0, pos - window)
-    idx = text.rfind(name, start, pos)
-    if idx == -1:
-        return ""
-    before = text[max(0, idx - 15):idx].upper()
-    if "MRS." in before or "MRS " in before:
-        return "Mrs."
-    if "MR." in before or "MR " in before:
-        return "Mr."
-    return ""
-
-
-def parse_affidavit(text):
-    """Return list of dicts: title, first, last, street, city, state, zip, full_address, context."""
-    results = []
-    for m in ADDRESS_RE.finditer(text):
-        street, city, st, zip5 = m.group(1).strip(), m.group(2).strip(), m.group(3), m.group(4)
-        name = find_name_before(text, m.start())
-        if not name or not is_natural_person(name):
-            continue
-        words = name.split()
-        first, last = words[0].strip("."), words[-1].strip(".")
-        title = guess_title(text, m.start(), name)
-        context = " ".join(text[max(0, m.start() - 120):m.end() + 20].split())
-        results.append({
-            "title": title, "first": first, "last": last,
-            "street": street, "city": city, "state": st, "zip": zip5,
-            "full_address": f"{street}, {city}, {st} {zip5}",
-            "context": context,
-        })
-    return results
+    try:
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=1024,
+            messages=[{
+                "role": "user",
+                "content": CLAUDE_PARSE_PROMPT.format(text=truncated),
+            }],
+        )
+        raw = response.content[0].text.strip()
+        # Strip markdown code fences if present
+        raw = re.sub(r"^```(?:json)?\s*", "", raw)
+        raw = re.sub(r"\s*```$", "", raw)
+        parsed = json.loads(raw)
+        if not isinstance(parsed, list):
+            return []
+        results = []
+        for item in parsed:
+            if not isinstance(item, dict):
+                continue
+            first = str(item.get("first", "")).strip()
+            last  = str(item.get("last", "")).strip()
+            if not first or not last:
+                continue
+            results.append({
+                "title":  str(item.get("title", "")).strip(),
+                "first":  first,
+                "last":   last,
+                "street": str(item.get("street", "")).strip(),
+                "city":   str(item.get("city", "")).strip(),
+                "state":  str(item.get("state", "")).strip(),
+                "zip":    str(item.get("zip", "")).strip(),
+            })
+        return results
+    except Exception as e:
+        print(f"    Claude parse failed: {e}")
+        return []
 
 
-# ── PDF extraction ────────────────────────────────────────────────────────────
+# ── PDF helpers ───────────────────────────────────────────────────────────────
 
-def extract_pdf_text(pdf_bytes):
-    fd, tmp_name = tempfile.mkstemp(suffix=".pdf")
-    os.close(fd)
-    tmp_path = Path(tmp_name)
-    tmp_path.write_bytes(pdf_bytes)
+def _safe_filename(label, max_len=80):
+    """Sanitize a document label for use as a filename."""
+    name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", label)
+    return name[:max_len].rstrip(". ")
+
+
+def save_and_extract_pdf(pdf_bytes, case_dir, filename):
+    """Save PDF bytes to case_dir/filename.pdf and return extracted text."""
+    case_dir.mkdir(parents=True, exist_ok=True)
+    pdf_path = case_dir / (filename + ".pdf")
+
+    # Don't re-download if we already have this file
+    if not pdf_path.exists():
+        pdf_path.write_bytes(pdf_bytes)
+        print(f"    Saved: {pdf_path}")
+    else:
+        print(f"    Already saved: {pdf_path}")
+
     text = ""
     try:
-        with pdfplumber.open(tmp_path) as pdf:
+        with pdfplumber.open(pdf_path) as pdf:
             text = "\n".join(page.extract_text() or "" for page in pdf.pages)
     except Exception as e:
         print(f"    pdfplumber failed ({e}); trying PyPDF2…")
         if PyPDF2:
             try:
-                reader = PyPDF2.PdfReader(str(tmp_path))
+                reader = PyPDF2.PdfReader(str(pdf_path))
                 text = "\n".join((p.extract_text() or "") for p in reader.pages)
             except Exception as e2:
                 print(f"    PyPDF2 also failed ({e2})")
-    finally:
-        tmp_path.unlink(missing_ok=True)
     return text
 
 
 # ── NYSCEF document list scraping ────────────────────────────────────────────
 
 def _click_for_url(context, page, link):
-    """Click a document link and return the resolved document URL, whether it
-    opens a new tab or navigates the current page."""
+    """Click a document link and return the resolved URL (handles new tab or same-page nav)."""
     try:
         with context.expect_page(timeout=8_000) as pi:
             link.click()
@@ -265,14 +265,15 @@ def _click_for_url(context, page, link):
 
 
 def collect_affidavit_docs(page, context, docket_id):
-    """Return list of {"label": str, "url": str} for AFFIDAVIT OF SERVICE docs."""
+    """Return list of {"label": str, "url": str} for affidavit-type documents."""
     encoded_id = quote(docket_id, safe="")
     docs, seen = [], set()
 
     def scan_current_page():
         for row in page.query_selector_all("table.NewSearchResults tr"):
             text = row.inner_text() or ""
-            if "affidavit of service" not in text.lower():
+            text_lower = text.lower()
+            if not any(dtype in text_lower for dtype in AFFIDAVIT_DOC_TYPES):
                 continue
             link = row.query_selector("a")
             if not link:
@@ -339,8 +340,8 @@ def send_report_email(report_lines, cases_checked, added_count, errors):
     )
 
     msg = MIMEMultipart()
-    msg["From"] = GMAIL_USER
-    msg["To"] = EMAIL_TO
+    msg["From"]    = GMAIL_USER
+    msg["To"]      = EMAIL_TO
     msg["Subject"] = subject
     msg.attach(MIMEText(body, "plain"))
 
@@ -359,15 +360,23 @@ def send_report_email(report_lines, cases_checked, added_count, errors):
 def main():
     import argparse
     parser = argparse.ArgumentParser()
-    parser.add_argument("--limit", type=int, default=0, help="Process only first N cases (0 = all)")
-    parser.add_argument("--dry-run", action="store_true", help="Parse and report only; do not write to Smartsheet")
+    parser.add_argument("--limit", type=int, default=0,
+                        help="Process only first N cases (0 = all)")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Parse and report only; do not write to Smartsheet")
     args = parser.parse_args()
 
-    token = os.environ.get("SMARTSHEET_API_TOKEN")
-    if not token:
+    ss_token = os.environ.get("SMARTSHEET_API_TOKEN")
+    if not ss_token:
         sys.exit("Error: SMARTSHEET_API_TOKEN environment variable not set.")
 
-    ss = smartsheet.Smartsheet(token)
+    anthropic_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not anthropic_key:
+        sys.exit("Error: ANTHROPIC_API_KEY environment variable not set.")
+
+    claude = anthropic.Anthropic(api_key=anthropic_key)
+
+    ss = smartsheet.Smartsheet(ss_token)
     ss.errors_as_exceptions(True)
 
     print("Fetching FC Mailers sheet…")
@@ -379,10 +388,12 @@ def main():
         cases = cases[:args.limit]
         print(f"(Limited to first {args.limit} case(s) for testing.)")
 
-    report_lines = []
-    new_rows = []
+    AFFIDAVIT_DIR.mkdir(parents=True, exist_ok=True)
+
+    report_lines  = []
+    new_rows      = []
     cases_checked = 0
-    errors = 0
+    errors        = 0
 
     with sync_playwright() as pw:
         context, browser, chrome_proc, chrome_tmp = launch_context(pw)
@@ -397,8 +408,12 @@ def main():
         for idx, entry in cases:
             docket = entry["docket"]
             print(f"\n[{idx}] docket={docket[:16]}…")
-            report_lines.append(f"\nCase {idx}  (Plaintiff: {entry['plaintiff'] or '?'}, County: {entry['county'] or '?'})")
+            report_lines.append(
+                f"\nCase {idx}  (Plaintiff: {entry['plaintiff'] or '?'}, "
+                f"County: {entry['county'] or '?'})"
+            )
             cases_checked += 1
+            case_dir = AFFIDAVIT_DIR / idx
 
             try:
                 docs = collect_affidavit_docs(page, context, docket)
@@ -410,43 +425,58 @@ def main():
                 continue
 
             if not docs:
-                report_lines.append("  No AFFIDAVIT OF SERVICE documents found.")
-                print("  No affidavit of service documents found.")
+                report_lines.append(
+                    "  No AFFIDAVIT OF SERVICE / DUE DILIGENCE documents found."
+                )
+                print("  No affidavit documents found.")
                 time.sleep(random.uniform(5, 10))
                 continue
 
-            for doc in docs:
-                print(f"  Found doc: {doc['label'][:80]}")
+            for doc_num, doc in enumerate(docs, 1):
+                print(f"  [{doc_num}/{len(docs)}] {doc['label'][:80]}")
                 pdf_bytes = download_pdf_bytes(context, doc["url"])
                 if not pdf_bytes:
                     report_lines.append(f"  [{doc['label'][:60]}] could not download PDF.")
                     errors += 1
                     continue
 
-                text = extract_pdf_text(pdf_bytes)
+                filename = _safe_filename(f"{doc_num:02d}_{doc['label']}")
+                text = save_and_extract_pdf(pdf_bytes, case_dir, filename)
+
                 if not text.strip():
-                    report_lines.append(f"  [{doc['label'][:60]}] no extractable text (possibly a scanned image).")
+                    report_lines.append(
+                        f"  [{doc['label'][:60]}] no extractable text "
+                        f"(possibly a scanned image)."
+                    )
                     time.sleep(random.uniform(2, 4))
                     continue
 
-                parsed = parse_affidavit(text)
+                parsed = parse_affidavit_with_claude(claude, text)
                 if not parsed:
-                    report_lines.append(f"  [{doc['label'][:60]}] no name/address pairs parsed.")
+                    report_lines.append(
+                        f"  [{doc['label'][:60]}] Claude found no natural persons / "
+                        f"addresses."
+                    )
                     time.sleep(random.uniform(2, 4))
                     continue
 
                 for p in parsed:
                     label = f"{p['title']} {p['first']} {p['last']}".strip()
+                    full_address = (
+                        f"{p['street']}, {p['city']}, {p['state']} {p['zip']}".strip(", ")
+                    )
                     key = norm(f"{p['first']} {p['last']} {p['street']} {p['zip']}")
                     if is_duplicate_key(key, entry["keys"]):
-                        report_lines.append(f"  Already on file: {label} — {p['full_address']}")
+                        report_lines.append(
+                            f"  Already on file: {label} — {full_address}"
+                        )
                         continue
                     entry["keys"].add(key)
                     report_lines.append(
-                        f"  NEW: {label} — {p['full_address']}  "
-                        f"(source: {doc['label'][:60]}; context: \"{p['context'][:100]}\")"
+                        f"  NEW: {label} — {full_address}  "
+                        f"(source: {doc['label'][:60]})"
                     )
-                    print(f"    * NEW: {label} — {p['full_address']}")
+                    print(f"    * NEW: {label} — {full_address}")
                     if not args.dry_run:
                         new_rows.append(build_row(ss, idx, entry, p))
 
@@ -459,7 +489,7 @@ def main():
             chrome_proc.terminate()
         if chrome_tmp:
             shutil.rmtree(chrome_tmp, ignore_errors=True)
-            print(f"  Cleaned up temp profile: {chrome_tmp}")
+            print(f"  Cleaned up temp Chrome profile: {chrome_tmp}")
 
     added_count = 0
     if new_rows:
