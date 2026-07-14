@@ -10,6 +10,7 @@ FC Mailers sheet. Emails a full report for manual review.
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import random
@@ -17,6 +18,7 @@ import shutil
 import difflib
 import smtplib
 import tempfile
+import urllib.request as _urllib_req
 from datetime import date
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
@@ -33,8 +35,76 @@ except ImportError:
     PyPDF2 = None
 
 from nyscef_tracker import (
-    NYSCEF_HOME, DOC_LIST_BASE, launch_context, cell_value, str_val, _find_max_page,
+    NYSCEF_HOME, DOC_LIST_BASE, cell_value, str_val, _find_max_page,
 )
+
+CHROME_BIN         = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+CHROME_PROFILE_DIR = Path.home() / "Library/Application Support/Google/Chrome"
+CDP_URL            = "http://localhost:9222"
+
+
+def _cdp_ready():
+    try:
+        _urllib_req.urlopen(f"{CDP_URL}/json/version", timeout=1)
+        return True
+    except Exception:
+        return False
+
+
+def launch_deed_checker_context(p):
+    """Launch Chrome with remote debugging, patching the profile so Chrome
+    downloads PDFs instead of opening them in its built-in viewer.
+
+    Chrome's built-in PDF viewer makes it impossible to capture raw PDF bytes
+    via Playwright — this preference patch (`plugins.always_open_pdf_externally`)
+    forces Chrome to treat PDF responses as file downloads, which Playwright
+    can intercept cleanly with page.expect_download().
+    """
+    proc = None
+    tmp_dir = None
+    if _cdp_ready():
+        print("Connecting to already-running Chrome on port 9222…")
+    else:
+        src_profile = CHROME_PROFILE_DIR / "Default"
+        tmp_dir = tempfile.mkdtemp(prefix="chrome_debug_")
+        dst_profile = Path(tmp_dir) / "Default"
+        print(f"Copying Chrome profile to {tmp_dir} …")
+        shutil.copytree(src_profile, dst_profile, symlinks=True)
+
+        # Patch: make Chrome download PDFs rather than view them inline
+        prefs_path = dst_profile / "Preferences"
+        if prefs_path.exists():
+            try:
+                prefs = json.loads(prefs_path.read_text(encoding="utf-8"))
+                prefs.setdefault("plugins", {})["always_open_pdf_externally"] = True
+                prefs_path.write_text(json.dumps(prefs), encoding="utf-8")
+                print("  Patched: plugins.always_open_pdf_externally = true")
+            except Exception as e:
+                print(f"  Warning: could not patch Chrome prefs: {e}")
+
+        print("  Profile copy done.")
+        print("Launching Chrome with remote debugging on port 9222…")
+        proc = subprocess.Popen([
+            CHROME_BIN,
+            "--remote-debugging-port=9222",
+            f"--user-data-dir={tmp_dir}",
+            "--no-first-run",
+            "--no-default-browser-check",
+        ])
+        for i in range(120):
+            if _cdp_ready():
+                print(f"  Chrome ready after {(i + 1) * 0.5:.1f}s")
+                break
+            time.sleep(0.5)
+        else:
+            proc.terminate()
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise RuntimeError("Chrome did not open remote debugging port within 60 s.")
+
+    browser = p.chromium.connect_over_cdp(CDP_URL)
+    ctx = browser.contexts[0] if browser.contexts else browser.new_context()
+    print(f"Browser: Google Chrome via CDP  (profile copy: {tmp_dir or 'pre-existing'})")
+    return ctx, browser, proc, tmp_dir
 
 SHEET_ID      = 6833160014063492  # FC Mailers
 EMAIL_TO      = "matt.zeltser@gmail.com"
@@ -310,16 +380,34 @@ def collect_affidavit_docs(page, context, docket_id):
 
 
 def download_pdf_bytes(context, url):
+    """Download a NYSCEF document PDF via Chrome's download mechanism.
+
+    With `plugins.always_open_pdf_externally = true` set in Chrome's profile,
+    Chrome treats PDF responses as file downloads rather than opening them in
+    the built-in viewer.  Playwright's expect_download() captures the file
+    before it reaches the filesystem, giving us the raw PDF bytes.
+    """
+    new_page = context.new_page()
     try:
-        resp = context.request.get(url, timeout=30_000)
-        if resp.ok:
-            body = resp.body()
-            ctype = (resp.headers.get("content-type") or "").lower()
-            if "pdf" in ctype or body[:4] == b"%PDF":
-                return body
+        with new_page.expect_download(timeout=30_000) as dl_info:
+            try:
+                new_page.goto(url, wait_until="commit", timeout=30_000)
+            except Exception as nav_err:
+                # Playwright raises "Download is starting" when a navigation
+                # triggers a download — this is expected; dl_info captures it.
+                if "download" not in str(nav_err).lower():
+                    raise
+        download = dl_info.value
+        data = Path(download.path()).read_bytes()
+        return data if data[:4] == b"%PDF" else None
     except Exception as e:
         print(f"    Download failed for {url}: {e}")
-    return None
+        return None
+    finally:
+        try:
+            new_page.close()
+        except Exception:
+            pass
 
 
 # ── email report ──────────────────────────────────────────────────────────────
@@ -396,7 +484,7 @@ def main():
     errors        = 0
 
     with sync_playwright() as pw:
-        context, browser, chrome_proc, chrome_tmp = launch_context(pw)
+        context, browser, chrome_proc, chrome_tmp = launch_deed_checker_context(pw)
         page = context.new_page()
 
         print("Warming up NYSCEF session…")
